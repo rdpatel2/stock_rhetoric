@@ -10,7 +10,7 @@ from rich.rule import Rule
 from rich.table import Table
 from rich.text import Text
 
-from .financials import Financials, KeyStats
+from .financials import Financials
 from .movers import MoverSnapshot
 from .report import Report
 from .scoring import Scorecard

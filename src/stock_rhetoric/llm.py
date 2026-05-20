@@ -13,6 +13,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
+from dotenv import load_dotenv
 
 import ollama
 
@@ -26,6 +27,7 @@ from .risk import RiskFlag
 from .scoring import Scorecard
 from .trends import TrendReport
 
+load_dotenv()
 
 DEFAULT_MODEL = os.environ.get("OLLAMA_MODEL", "llama3.2:3b")
 OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
