@@ -32,6 +32,7 @@ class CompanyInfo:
     market_cap: Optional[float] = None
     enterprise_value: Optional[float] = None
     currency: str = "USD"
+    business_summary: Optional[str] = None
 
 
 @dataclass
@@ -73,6 +74,7 @@ class KeyStats:
     dividend_yield: Optional[float] = None
     payout_ratio: Optional[float] = None
     short_pct_float: Optional[float] = None
+    r_and_d_pct: Optional[float] = None
 
 
 @dataclass
@@ -86,6 +88,7 @@ class FinancialPeriod:
     eps_basic: Optional[float] = None
     eps_diluted: Optional[float] = None
     interest_expense: Optional[float] = None
+    research_development: Optional[float] = None
     total_assets: Optional[float] = None
     total_liabilities: Optional[float] = None
     total_equity: Optional[float] = None
@@ -103,6 +106,14 @@ class FinancialPeriod:
 
 
 @dataclass
+class EarningsRecord:
+    quarter: Optional[date] = None
+    eps_estimate: Optional[float] = None
+    eps_actual: Optional[float] = None
+    surprise_pct: Optional[float] = None  # percentage points: 5.2 means +5.2%
+
+
+@dataclass
 class Financials:
     company: CompanyInfo
     price: PricePerformance = field(default_factory=PricePerformance)
@@ -114,6 +125,10 @@ class Financials:
     analyst_mean_target: Optional[float] = None
     analyst_recommendation: Optional[str] = None
     earnings_surprises_pct: list[float] = field(default_factory=list)
+    earnings_records: list[EarningsRecord] = field(default_factory=list)
+    next_earnings_date: Optional[date] = None
+    ex_dividend_date: Optional[date] = None
+    top_institutional_holders: list[dict] = field(default_factory=list)
     raw_info: dict = field(default_factory=dict)  # original yfinance info (debugging)
 
 
@@ -138,6 +153,12 @@ _INCOME_ALIASES = {
     "eps_basic": ["Basic EPS", "BasicEPS"],
     "eps_diluted": ["Diluted EPS", "DilutedEPS"],
     "interest_expense": ["Interest Expense", "InterestExpense"],
+    "research_development": [
+        "Research And Development",
+        "ResearchAndDevelopment",
+        "Research Development",
+        "Research and Development",
+    ],
 }
 _BALANCE_ALIASES = {
     "total_assets": ["Total Assets", "TotalAssets"],
@@ -351,6 +372,11 @@ def _key_stats(info: dict, annual: list[FinancialPeriod]) -> KeyStats:
             invested = (latest.total_equity or 0) + (latest.total_debt or 0)
             if invested > 0:
                 s.roic = latest.operating_income * (1 - 0.21) / invested
+    # R&D as % of revenue
+    if annual:
+        latest = annual[-1]
+        if latest.research_development and latest.revenue:
+            s.r_and_d_pct = latest.research_development / latest.revenue
     return s
 
 
@@ -380,6 +406,7 @@ def fetch(ticker: str) -> Financials:
         market_cap=info.get("marketCap"),
         enterprise_value=info.get("enterpriseValue"),
         currency=info.get("currency", "USD"),
+        business_summary=info.get("longBusinessSummary"),
     )
 
     annual = _periods_from_statements(
@@ -409,6 +436,37 @@ def fetch(ticker: str) -> Financials:
     fin.price = _price_performance(t, info)
     fin.stats = _key_stats(info, annual)
 
+    # Next earnings date + ex-dividend date from the calendar
+    try:
+        cal = t.calendar
+        if isinstance(cal, pd.DataFrame) and not cal.empty:
+            # Newer yfinance returns a DataFrame; collapse first column to dict.
+            cal = {str(k): v for k, v in cal.iloc[:, 0].items()}
+        if isinstance(cal, dict):
+            ed = cal.get("Earnings Date")
+            if isinstance(ed, (list, tuple)) and ed:
+                fin.next_earnings_date = pd.Timestamp(ed[0]).date()
+            elif ed is not None:
+                fin.next_earnings_date = pd.Timestamp(ed).date()
+            dd = cal.get("Ex-Dividend Date") or cal.get("Dividend Date")
+            if dd is not None:
+                fin.ex_dividend_date = pd.Timestamp(dd).date()
+    except Exception:
+        pass
+
+    # Top institutional holders
+    try:
+        ih = t.institutional_holders
+        if isinstance(ih, pd.DataFrame) and not ih.empty:
+            for _, row in ih.head(5).iterrows():
+                name = str(row.get("Holder") or row.get("holder") or "")
+                pct = float(row.get("% Out") or row.get("pctHeld") or 0)
+                shares = int(row.get("Shares") or row.get("shares") or 0)
+                if name:
+                    fin.top_institutional_holders.append({"name": name, "pct": pct, "shares": shares})
+    except Exception:
+        pass
+
     # Insider net shares (last 6 months — yfinance returns a DataFrame)
     try:
         ins = t.insider_transactions
@@ -429,13 +487,34 @@ def fetch(ticker: str) -> Financials:
     fin.analyst_mean_target = info.get("targetMeanPrice")
     fin.analyst_recommendation = info.get("recommendationKey")
 
-    # Earnings surprises (% surprise per quarter)
+    # Earnings history: surprise % list + per-quarter records for the table
     try:
         eh = t.earnings_history
-        if isinstance(eh, pd.DataFrame) and not eh.empty and "surprisePercent" in eh.columns:
-            fin.earnings_surprises_pct = [
-                float(v) for v in eh["surprisePercent"].dropna().tail(4).tolist()
-            ]
+        if isinstance(eh, pd.DataFrame) and not eh.empty:
+            if "surprisePercent" in eh.columns:
+                fin.earnings_surprises_pct = [
+                    float(v) for v in eh["surprisePercent"].dropna().tail(4).tolist()
+                ]
+            records = []
+            for idx, row in eh.tail(4).iterrows():
+                try:
+                    q = pd.Timestamp(idx).date()
+                except Exception:
+                    q = None
+
+                def _ef(v):
+                    try:
+                        return float(v) if v is not None and not pd.isna(v) else None
+                    except Exception:
+                        return None
+
+                records.append(EarningsRecord(
+                    quarter=q,
+                    eps_estimate=_ef(row.get("epsEstimate")),
+                    eps_actual=_ef(row.get("epsActual")),
+                    surprise_pct=_ef(row.get("surprisePercent")),
+                ))
+            fin.earnings_records = records
     except Exception:
         pass
 
