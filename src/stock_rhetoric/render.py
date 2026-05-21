@@ -184,6 +184,60 @@ def _ownership_panel(fin: Financials) -> Optional[Panel]:
     return Panel(t, title=title, border_style="cyan")
 
 
+def _finra_panel(finra) -> Optional[Panel]:
+    """Render short-sale z-score per-day table from FINRA CNMS consolidated data."""
+    if finra is None:
+        return None
+    recent = finra.recent_days()
+    if not recent:
+        return None
+
+    mean = finra.baseline_mean()
+    std = finra.baseline_std()
+    mean_str = f"{mean * 100:.1f}%" if mean is not None else "—"
+    std_str = f"{std * 100:.1f}%" if std is not None else "—"
+    baseline_line = Text.from_markup(
+        f"[dim]30-day baseline · avg {mean_str}  std {std_str}[/]"
+    )
+
+    t = Table(show_header=True, header_style="dim", expand=True, box=None, padding=(0, 1))
+    t.add_column("Date", style="dim")
+    t.add_column("Short %", justify="right")
+    t.add_column("Z-Score", justify="right")
+    t.add_column("Signal", justify="center")
+
+    _label_color = {"Bearish": "bright_red", "Bullish": "green", "Neutral": "yellow"}
+
+    for d in recent:
+        label = finra.day_label(d)
+        z = finra.day_z_score(d)
+        color = _label_color.get(label, "dim")
+        z_str = f"[{color}]{z:+.2f}σ[/]" if z is not None else "[dim]—[/]"
+        t.add_row(
+            d.date.strftime("%b %d"),
+            f"{d.short_pct * 100:.1f}%",
+            z_str,
+            f"[{color}]{label}[/]",
+        )
+
+    avg_z = finra.avg_z_score()
+    direction = finra.directional_label()
+    dir_color = _label_color.get(direction, "dim")
+    z_avg_str = f"[{dir_color}]{avg_z:+.2f}σ[/]" if avg_z is not None else "[dim]—[/]"
+    signal_line = Text.from_markup(
+        f"Signal: [{dir_color}]{direction}[/]   avg z-score: {z_avg_str}"
+    )
+    if finra.fetch_error:
+        signal_line.append(f"  ({finra.fetch_error})", style="dim")
+
+    from rich.console import Group
+    return Panel(
+        Group(baseline_line, t, signal_line),
+        title="Short Sale Activity  [dim](FINRA CNMS · 30-day z-score)[/]",
+        border_style="magenta",
+    )
+
+
 def _earnings_table(fin: Financials) -> Optional[Table]:
     if not fin.earnings_records:
         return None
@@ -362,7 +416,7 @@ def render_report(console: Console, report: Report) -> None:
     console.print(_header_panel(fin))
 
     overview = _business_overview_panel(fin)
-    if overview is not None:
+    if overview:
         console.print(overview)
 
     if n.executive_summary:
@@ -376,14 +430,18 @@ def render_report(console: Console, report: Report) -> None:
     console.print(bear)
 
     ownership = _ownership_panel(fin)
-    if ownership is not None:
+    if ownership:
         console.print(ownership)
+
+    finra_panel = _finra_panel(getattr(report, "finra", None))
+    if finra_panel:
+        console.print(finra_panel)
 
     console.print(_key_metrics_table(fin, report))
     console.print(_trend_table(report))
 
     earnings = _earnings_table(fin)
-    if earnings is not None:
+    if earnings:
         console.print(earnings)
 
     if n.valuation_paragraph:
