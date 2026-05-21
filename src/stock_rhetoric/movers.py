@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 import yfinance as yf
-
+from yahooquery import Screener
 
 @dataclass
 class MoverSnapshot:
@@ -20,21 +20,11 @@ class MoverSnapshot:
 
 def _try_screen(limit: int) -> list[dict]:
     """Use yfinance's screener if available; return raw quote dicts."""
-    # yfinance versions ≥ 0.2.40 expose `yf.screen` and `yf.PREDEFINED_SCREENER_BODIES`.
     try:
-        body = yf.PREDEFINED_SCREENER_BODIES.get("day_gainers")  # type: ignore[attr-defined]
-        if body is None:
-            return []
-        res = yf.screen(body, count=limit)  # type: ignore[attr-defined]
-        return res.get("quotes", [])
-    except Exception:
-        pass
-    # Older versions sometimes had `yf.screener`. Try that:
-    try:
-        s = yf.Screener()  # type: ignore[attr-defined]
-        s.set_predefined_body("day_gainers")
-        s.set_default_body(s.body)
-        return (s.response or {}).get("quotes", [])
+        s = Screener()
+        response = s.get_screeners("day_gainers").get("day_gainers")
+        print(response.keys())
+        return (response or {}).get("quotes", [])
     except Exception:
         return []
 

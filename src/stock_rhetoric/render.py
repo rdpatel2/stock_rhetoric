@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import date as _date
 from typing import Optional
 
 from rich.console import Console
@@ -10,7 +11,7 @@ from rich.rule import Rule
 from rich.table import Table
 from rich.text import Text
 
-from .financials import Financials, KeyStats
+from .financials import Financials
 from .movers import MoverSnapshot
 from .report import Report
 from .scoring import Scorecard
@@ -120,7 +121,21 @@ def _header_panel(fin: Financials) -> Panel:
         sign = "+" if p.change_today_pct >= 0 else ""
         color = "bright_green" if p.change_today_pct >= 0 else "red"
         price_line += f"   [{color}]{sign}{p.change_today_pct * 100:.2f}% today[/]"
-    body = Text.from_markup(f"{sub}\n{price_line}")
+    body_markup = f"{sub}\n{price_line}"
+    catalyst_parts: list[str] = []
+    today = _date.today()
+    if fin.next_earnings_date:
+        days = (fin.next_earnings_date - today).days
+        ed_str = fin.next_earnings_date.strftime("%b %d")
+        if 0 <= days <= 10:
+            catalyst_parts.append(f"[bold red]⚠ Earnings in {days}d ({ed_str})[/]")
+        else:
+            catalyst_parts.append(f"Earnings: {ed_str}")
+    if fin.ex_dividend_date:
+        catalyst_parts.append(f"Ex-Div: {fin.ex_dividend_date.strftime('%b %d')}")
+    if catalyst_parts:
+        body_markup += "\n" + "  ·  ".join(catalyst_parts)
+    body = Text.from_markup(body_markup)
     title = f"[bold cyan]{c.ticker}[/] · {c.name} · {c.exchange or ''}"
     return Panel(body, title=title, border_style="cyan")
 
@@ -143,6 +158,109 @@ def _bullets_panel(title: str, items: list[str], style: str) -> Panel:
         lines = [Text.from_markup(f"• {item}") for item in items]
         body = Text("\n").join(lines)
     return Panel(body, title=title, border_style=style)
+
+
+def _business_overview_panel(fin: Financials) -> Optional[Panel]:
+    s = fin.company.business_summary
+    if not s or len(s) < 50:
+        return None
+    return Panel(Text(s), title=f"About {fin.company.name}", border_style="dim")
+
+
+def _ownership_panel(fin: Financials) -> Optional[Panel]:
+    if not fin.top_institutional_holders:
+        return None
+    t = Table(box=None, show_header=True, padding=(0, 1))
+    t.add_column("Institution", style="bold")
+    t.add_column("% Owned", justify="right")
+    t.add_column("Shares", justify="right")
+    for h in fin.top_institutional_holders:
+        pct_str = f"{h['pct'] * 100:.2f}%" if h["pct"] else "—"
+        t.add_row(h["name"], pct_str, fmt_money(h["shares"]))
+    inst_pct = fin.institutional_ownership_pct
+    title = "Ownership"
+    if inst_pct:
+        title += f"  · Institutions {inst_pct * 100:.1f}%"
+    return Panel(t, title=title, border_style="cyan")
+
+
+def _finra_panel(finra) -> Optional[Panel]:
+    """Render short-sale z-score per-day table from FINRA CNMS consolidated data."""
+    if finra is None:
+        return None
+    recent = finra.recent_days()
+    if not recent:
+        return None
+
+    mean = finra.baseline_mean()
+    std = finra.baseline_std()
+    mean_str = f"{mean * 100:.1f}%" if mean is not None else "—"
+    std_str = f"{std * 100:.1f}%" if std is not None else "—"
+    baseline_line = Text.from_markup(
+        f"[dim]30-day baseline · avg {mean_str}  std {std_str}[/]"
+    )
+
+    t = Table(show_header=True, header_style="dim", expand=True, box=None, padding=(0, 1))
+    t.add_column("Date", style="dim")
+    t.add_column("Short %", justify="right")
+    t.add_column("Z-Score", justify="right")
+    t.add_column("Signal", justify="center")
+
+    _label_color = {"Bearish": "bright_red", "Bullish": "green", "Neutral": "yellow"}
+
+    for d in recent:
+        label = finra.day_label(d)
+        z = finra.day_z_score(d)
+        color = _label_color.get(label, "dim")
+        z_str = f"[{color}]{z:+.2f}σ[/]" if z is not None else "[dim]—[/]"
+        t.add_row(
+            d.date.strftime("%b %d"),
+            f"{d.short_pct * 100:.1f}%",
+            z_str,
+            f"[{color}]{label}[/]",
+        )
+
+    avg_z = finra.avg_z_score()
+    direction = finra.directional_label()
+    dir_color = _label_color.get(direction, "dim")
+    z_avg_str = f"[{dir_color}]{avg_z:+.2f}σ[/]" if avg_z is not None else "[dim]—[/]"
+    signal_line = Text.from_markup(
+        f"Signal: [{dir_color}]{direction}[/]   avg z-score: {z_avg_str}"
+    )
+    if finra.fetch_error:
+        signal_line.append(f"  ({finra.fetch_error})", style="dim")
+
+    from rich.console import Group
+    return Panel(
+        Group(baseline_line, t, signal_line),
+        title="Short Sale Activity  [dim](FINRA CNMS · 30-day z-score)[/]",
+        border_style="magenta",
+    )
+
+
+def _earnings_table(fin: Financials) -> Optional[Table]:
+    if not fin.earnings_records:
+        return None
+    t = Table(title="Recent Earnings (Last 4 Quarters)", expand=True)
+    t.add_column("Quarter")
+    t.add_column("EPS Est.", justify="right")
+    t.add_column("EPS Act.", justify="right")
+    t.add_column("Surprise", justify="right")
+    t.add_column("Beat / Miss", justify="center", width=10)
+    for r in fin.earnings_records:
+        q_str = r.quarter.strftime("%b '%y") if r.quarter else "—"
+        est = fmt_ratio(r.eps_estimate) if r.eps_estimate is not None else "—"
+        act = fmt_ratio(r.eps_actual) if r.eps_actual is not None else "—"
+        if r.surprise_pct is not None:
+            sign = "+" if r.surprise_pct >= 0 else ""
+            color = "bright_green" if r.surprise_pct > 0 else "red"
+            surprise_str = f"[{color}]{sign}{r.surprise_pct:.2f}%[/]"
+            beat_miss = f"[{color}]{'BEAT' if r.surprise_pct > 0 else 'MISS'}[/]"
+        else:
+            surprise_str = "[dim]—[/]"
+            beat_miss = "[dim]—[/]"
+        t.add_row(q_str, est, act, surprise_str, beat_miss)
+    return t
 
 
 _TREND_GLYPHS: dict[str, str] = {
@@ -175,6 +293,8 @@ def _key_metrics_table(fin: Financials, report: Report) -> Table:
     add("Gross margin", fmt_pct(s.gross_margin), report.trends.gross_margin.direction, peer_med.get("gross_margin"), fmt=fmt_pct)
     add("Operating margin", fmt_pct(s.operating_margin), report.trends.operating_margin.direction, peer_med.get("operating_margin"), fmt=fmt_pct)
     add("Net margin", fmt_pct(s.net_margin), report.trends.net_margin.direction, peer_med.get("net_margin"), fmt=fmt_pct)
+    if s.r_and_d_pct is not None:
+        add("R&D / Revenue", fmt_pct(s.r_and_d_pct))
     add("ROE", fmt_pct(s.roe), peer=peer_med.get("roe"), fmt=fmt_pct)
     add("ROA", fmt_pct(s.roa), peer=peer_med.get("roa"), fmt=fmt_pct)
     add("ROIC (est.)", fmt_pct(s.roic))
@@ -188,6 +308,8 @@ def _key_metrics_table(fin: Financials, report: Report) -> Table:
     t.add_column("Latest", justify="right")
     t.add_column("Trend", justify="center", width=6)
     t.add_column("Peer median", justify="right")
+    if report.peers and report.peers.tickers:
+        t.caption = "Peer median vs: " + " · ".join(report.peers.tickers[:6])
     for name, latest, trend, peer in rows:
         t.add_row(name, latest, trend, peer)
     return t
@@ -293,6 +415,10 @@ def render_report(console: Console, report: Report) -> None:
 
     console.print(_header_panel(fin))
 
+    overview = _business_overview_panel(fin)
+    if overview:
+        console.print(overview)
+
     if n.executive_summary:
         console.print(Panel(Text(n.executive_summary), title="Executive Summary", border_style="cyan"))
 
@@ -303,8 +429,20 @@ def render_report(console: Console, report: Report) -> None:
     console.print(bull)
     console.print(bear)
 
+    ownership = _ownership_panel(fin)
+    if ownership:
+        console.print(ownership)
+
+    finra_panel = _finra_panel(getattr(report, "finra", None))
+    if finra_panel:
+        console.print(finra_panel)
+
     console.print(_key_metrics_table(fin, report))
     console.print(_trend_table(report))
+
+    earnings = _earnings_table(fin)
+    if earnings:
+        console.print(earnings)
 
     if n.valuation_paragraph:
         console.print(Panel(Text(n.valuation_paragraph), title="Valuation Assessment", border_style="cyan"))
