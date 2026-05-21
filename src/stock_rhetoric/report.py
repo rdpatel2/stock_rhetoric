@@ -7,7 +7,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Optional
 
-from . import aggregator, financials, llm, peers, risk, scoring, trends
+from . import aggregator, financials, finra as finra_mod, llm, peers, risk, scoring, trends
 
 
 @dataclass
@@ -19,6 +19,7 @@ class Report:
     risk_flags: list[risk.RiskFlag]
     sentiment: aggregator.SentimentBundle
     narrative: llm.Narrative
+    finra: Optional[finra_mod.FinraData] = None
     stage_timings: dict[str, float] = field(default_factory=dict)
 
 
@@ -44,11 +45,20 @@ async def build(
         if on_stage:
             on_stage(stage)
 
-    _emit("financials + sentiment")
+    _emit("financials + sentiment + FINRA")
     t0 = time.monotonic()
     fin_future = asyncio.to_thread(financials.fetch, ticker)
     sent_future = aggregator.gather(ticker, per_source_timeout=source_timeout)
-    fin, sentiment = await asyncio.gather(fin_future, sent_future)
+
+    async def _safe_finra() -> Optional[finra_mod.FinraData]:
+        try:
+            return await asyncio.wait_for(finra_mod.fetch(ticker), timeout=20.0)
+        except Exception:
+            return None
+
+    fin, sentiment, finra_data = await asyncio.gather(
+        fin_future, sent_future, _safe_finra()
+    )
     timings["fetch"] = time.monotonic() - t0
 
     _emit("peer comparison")
@@ -102,5 +112,6 @@ async def build(
         risk_flags=flags,
         sentiment=sentiment,
         narrative=narrative,
+        finra=finra_data,
         stage_timings=timings,
     )

@@ -146,6 +146,79 @@ If the report renders but the prose / bullets / direction look blank, the model 
 output the parser couldn't interpret. The raw response is saved to
 `~/.cache/stock_rhetoric/llm_debug/` for inspection.
 
+## Short Sale Activity (FINRA)
+
+Each report includes a **Short Sale Activity** panel sourced from FINRA's daily
+RegSHO Consolidated NMS (CNMS) short-sale volume files. These are publicly
+available — no account or API key required.
+
+### Data source
+
+FINRA publishes one pipe-delimited file per trading day covering all three major
+venues (CBOE, NASDAQ, NYSE) in a single consolidated record:
+
+```
+https://cdn.finra.org/equity/regsho/daily/CNMSshvol{YYYYMMDD}.txt
+```
+
+Each row contains the ticker, short volume, short-exempt volume, and total volume
+for that day. The tool fetches the last **30 trading days** concurrently and
+extracts only the row matching the requested ticker.
+
+### What "short volume" means
+
+Short volume is the number of shares sold short on that day across exchange-reported
+trades. It is **not** the same as short interest (total outstanding short positions).
+A high short-volume day means a large fraction of the day's traded shares were
+initiated as short sales — this can reflect hedging, arbitrage, or directional
+bearish bets, so context matters.
+
+### How the signal is calculated
+
+Rather than using a fixed threshold (e.g., "55% = bearish"), the signal is
+stock-specific and adapts to each ticker's historical baseline:
+
+1. **Baseline** — compute the mean and sample standard deviation of `short% =
+   short_volume / total_volume` across all 30 fetched trading days.
+
+2. **Z-score per day** — for each of the most recent 5 days:
+   ```
+   z = (day_short_pct − baseline_mean) / baseline_std
+   ```
+
+3. **Day label** — based on that day's z-score:
+   - `z > +1.5σ` → **Bearish** (unusually high short selling relative to this stock's norm)
+   - `z < −1.5σ` → **Bullish** (unusually low short selling)
+   - otherwise → **Neutral**
+
+4. **Overall signal** — the average z-score of the last 5 days is compared to the
+   same ±1.5σ thresholds to produce the panel's headline **Signal**.
+
+Using z-scores rather than absolute percentages means the signal accounts for
+sector and stock-level differences. A 45% short-volume day is unremarkable for
+a heavily-shorted small-cap but would be an extreme outlier for a mega-cap index
+constituent.
+
+### Panel output
+
+```
+30-day baseline · avg 42.3%  std 4.1%
+
+ Date    Short %   Z-Score   Signal
+ May 14   44.2%   +0.46σ    Neutral
+ May 15   39.1%   −0.78σ    Neutral
+ May 16   51.8%   +2.31σ    Bearish
+ May 19   48.3%   +1.46σ    Neutral
+ May 20   53.4%   +2.71σ    Bearish
+
+Signal: Bearish   avg z-score: +1.23σ
+```
+
+If fewer than 10 days are retrieved (e.g., FINRA files are delayed or the ticker
+is thinly listed), a note is shown alongside the signal and the z-score may be
+less reliable. The report never crashes on a FINRA failure — the panel is simply
+omitted if no data arrives within the 20-second timeout.
+
 ## Testing
 
 ```bash
