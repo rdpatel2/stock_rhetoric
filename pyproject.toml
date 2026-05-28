@@ -22,6 +22,8 @@ dependencies = [
     "rich>=13.7",
     "python-dotenv>=1.0",
     "vaderSentiment>=3.3",
+    "python-telegram-bot>=21.6",
+    "groq>=0.13",
 ]
 
 [project.optional-dependencies]
@@ -33,6 +35,7 @@ dev = [
 
 [project.scripts]
 stock-rhetoric = "stock_rhetoric.cli:app"
+stock-rhetoric-bot = "stock_rhetoric.bot:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

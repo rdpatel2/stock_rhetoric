@@ -38,7 +38,7 @@ def test_narrate_returns_empty_on_ollama_error(monkeypatch, strong_company_finan
     monkeypatch.setattr(llm.ollama, "Client", FailingClient)
     tr, ps, sc, flags, sent = _full_context(strong_company_financials)
     nar = llm.narrate(strong_company_financials, tr, ps, sc, flags, sent)
-    assert "Ollama error" in nar.executive_summary or "Ollama error" in nar.rationale
+    assert "LLM error" in nar.executive_summary or "LLM error" in nar.rationale
     assert nar.direction in {"BUY", "HOLD", "SELL"}
 
 
