@@ -31,9 +31,12 @@ load_dotenv()
 
 DEFAULT_MODEL = os.environ.get("OLLAMA_MODEL", "llama3.2:3b")
 OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
-# Hard ceiling on the Ollama call. If the model is large or the hardware slow,
+# Hard ceiling on the LLM call. If the model is large or the hardware slow,
 # the prose is skipped rather than holding the report hostage.
 OLLAMA_TIMEOUT_S = float(os.environ.get("OLLAMA_TIMEOUT_S", "90"))
+
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
+GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama-3.1-8b-instant")
 
 
 @dataclass
@@ -153,6 +156,37 @@ def _build_facts(
             for i in sentiment.social[:2]
         ],
     }
+
+
+def _call_groq_stream(
+    system: str,
+    user: str,
+    model: str,
+    timeout_s: float,
+    num_predict: int,
+    on_token: Optional[callable] = None,
+) -> str:
+    """Stream tokens from Groq API. Returns the full concatenated string."""
+    from groq import Groq
+    client = Groq(api_key=GROQ_API_KEY, timeout=timeout_s)
+    parts: list[str] = []
+    stream = client.chat.completions.create(
+        model=model,
+        messages=[
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+        stream=True,
+        max_tokens=num_predict,
+        temperature=0.2,
+    )
+    for chunk in stream:
+        tok = chunk.choices[0].delta.content or ""
+        if tok:
+            parts.append(tok)
+            if on_token:
+                on_token(tok)
+    return "".join(parts)
 
 
 def _call_ollama_stream(
@@ -375,9 +409,12 @@ def narrate(
     user_msg = json.dumps(facts, default=str)
 
     try:
-        raw = _call_ollama_stream(SYSTEM_PROMPT, user_msg, model, timeout_s, 350, on_token)
+        if GROQ_API_KEY:
+            raw = _call_groq_stream(SYSTEM_PROMPT, user_msg, GROQ_MODEL, timeout_s, 350, on_token)
+        else:
+            raw = _call_ollama_stream(SYSTEM_PROMPT, user_msg, model, timeout_s, 350, on_token)
     except Exception as e:
-        return Narrative.empty(f"Ollama error: {e!s}")
+        return Narrative.empty(f"LLM error: {e!s}")
 
     if not raw.strip():
         # No tokens captured. Either the model returned nothing or chunk extraction failed.
@@ -416,9 +453,14 @@ def narrate(
 
     if include_paragraphs:
         try:
-            extras_raw = _call_ollama_stream(
-                PARAGRAPHS_PROMPT, user_msg, model, timeout_s, 500, on_token,
-            )
+            if GROQ_API_KEY:
+                extras_raw = _call_groq_stream(
+                    PARAGRAPHS_PROMPT, user_msg, GROQ_MODEL, timeout_s, 500, on_token,
+                )
+            else:
+                extras_raw = _call_ollama_stream(
+                    PARAGRAPHS_PROMPT, user_msg, model, timeout_s, 500, on_token,
+                )
             extras = _parse_structured(extras_raw)
             nar.valuation_paragraph = str(extras.get("VALUATION", ""))
             nar.balance_sheet_paragraph = str(extras.get("BALANCE_SHEET", ""))

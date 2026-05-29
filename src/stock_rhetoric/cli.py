@@ -10,7 +10,7 @@ import typer
 from dotenv import load_dotenv
 from rich.console import Console
 
-from . import guide, market, movers, render, report
+from . import guide, market, movers, render, report, watchlist
 
 load_dotenv()
 
@@ -59,12 +59,59 @@ async def _run_report(ticker: str, with_llm: bool, deep: bool, model: Optional[s
     render.render_report(_console, r)
 
 
+def _cli_handle_add(raw_ticker: str) -> None:
+    status, norm = watchlist.add("cli", raw_ticker)
+    count = len(watchlist.get("cli"))
+    if status == "added":
+        _console.print(f"[green]✓ Tracking {norm} ({count} in watchlist).[/]")
+    elif status == "duplicate":
+        _console.print(f"[yellow]Already tracking {norm}.[/]")
+    else:  # invalid
+        _console.print(f"[red]'{norm}' isn't a valid ticker.[/]")
+
+
+def _cli_handle_remove(raw_ticker: str) -> None:
+    status, norm = watchlist.remove("cli", raw_ticker)
+    if status == "removed":
+        _console.print(f"[green]✓ Stopped tracking {norm}.[/]")
+    elif status == "not_in_list":
+        _console.print(f"[yellow]{norm} isn't in your watchlist.[/]")
+    else:  # invalid
+        _console.print(f"[red]'{norm}' isn't a valid ticker.[/]")
+
+
+async def _cli_handle_list() -> None:
+    tickers = watchlist.get("cli")
+    if not tickers:
+        _console.print("[dim]Watchlist is empty. Use 'add AAPL' to start.[/]")
+        return
+    quotes = await watchlist.build_digest(tickers)
+    _console.print("[bold]Watchlist:[/]")
+    for q in quotes:
+        price = f"${q.price:.2f}" if q.price is not None else "n/a"
+        _console.print(f"  • {q.ticker}  {price}")
+
+
 async def _ticker_loop(with_llm: bool, deep: bool, model: Optional[str]) -> None:
     while True:
-        raw = typer.prompt("\nEnter a ticker (or 'q' to quit)", default="q", show_default=False)
+        raw = typer.prompt(
+            "\nEnter a ticker, 'add X' / 'remove X' / 'list' (or 'q' to quit)",
+            default="q", show_default=False,
+        )
         if raw.strip().lower() in {"q", "quit", "exit"}:
             _console.print("[dim]Bye.[/]")
             return
+        verb_parts = raw.strip().upper().split(maxsplit=1)
+        verb = verb_parts[0] if verb_parts else ""
+        if verb == "ADD" and len(verb_parts) == 2:
+            _cli_handle_add(verb_parts[1])
+            continue
+        if verb in {"REMOVE", "RM"} and len(verb_parts) == 2:
+            _cli_handle_remove(verb_parts[1])
+            continue
+        if verb in {"LIST", "WATCHLIST"}:
+            await _cli_handle_list()
+            continue
         ticker = _normalize_ticker(raw)
         if ticker is None:
             _console.print(f"[red]'{raw}' isn't a valid ticker. Try again.[/]")
