@@ -94,12 +94,12 @@ def _header(report: Report) -> list[str]:
     if p.current is not None:
         price_parts.append(f"${_fmt_num(p.current, '{:.2f}')}")
     if p.low_52w is not None and p.high_52w is not None:
-        price_parts.append(f"52w ${_fmt_num(p.low_52w, '{:.2f}')}–${_fmt_num(p.high_52w, '{:.2f}')}")
+        price_parts.append(f"52w: ${_fmt_num(p.low_52w, '{:.2f}')}–${_fmt_num(p.high_52w, '{:.2f}')}")
     if p.return_1w is not None:
-        price_parts.append(f"1w {_fmt_pct(p.return_1w, 0)}")
+        price_parts.append(f"1w: {_fmt_pct(p.return_1w, 0)}")
     if p.return_1y is not None:
-        price_parts.append(f"1y {_fmt_pct(p.return_1y, 0)}")
-    line3 = escape_mdv2(" \n ".join(price_parts)) if price_parts else ""
+        price_parts.append(f"1y: {_fmt_pct(p.return_1y, 0)}")
+    line3 = escape_mdv2("\n".join(price_parts)) if price_parts else ""
     return [l for l in (line1, line2, line3) if l]
 
 
