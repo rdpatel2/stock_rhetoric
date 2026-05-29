@@ -10,10 +10,12 @@ systemd (see `deploy/stock-rhetoric-bot.service`).
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import re
 from datetime import time as dtime
+from pathlib import Path
 from typing import Optional
 from zoneinfo import ZoneInfo
 
@@ -49,6 +51,73 @@ log = logging.getLogger("stock_rhetoric.bot")
 
 _TICKER_RE = re.compile(r"^[A-Z][A-Z0-9.\-]{0,9}$")
 _USER_LOCKS: dict[int, asyncio.Lock] = {}
+
+_PENDING_DIR = Path(
+    os.environ.get(
+        "STOCK_RHETORIC_PENDING_DIR",
+        str(Path.home() / ".cache" / "stock_rhetoric" / "pending_updates"),
+    )
+)
+
+
+def _persist_update(update: Update) -> None:
+    """Write the incoming Update to disk so it survives a crash/suspend mid-handler."""
+    try:
+        _PENDING_DIR.mkdir(parents=True, exist_ok=True)
+        path = _PENDING_DIR / f"{update.update_id}.json"
+        path.write_text(update.to_json())
+    except Exception:
+        log.exception("failed to persist pending update %s", update.update_id)
+
+
+def _clear_update(update_id: int) -> None:
+    try:
+        (_PENDING_DIR / f"{update_id}.json").unlink(missing_ok=True)
+    except Exception:
+        log.exception("failed to clear pending update %s", update_id)
+
+
+async def _notify_pending_on_startup(application: Application) -> None:
+    """If the machine crashed/suspended with messages in flight, notify their senders.
+
+    Telegram already retries failed webhook deliveries, so this is a safety net for
+    the case where the proxy delivered the update, the bot ack'd 200, then died
+    before completing the work. We send a short "I was offline" notice rather than
+    silently re-running the (possibly stale) request.
+    """
+    if not _PENDING_DIR.exists():
+        return
+    allowlist: set[int] = application.bot_data.get("allowlist", set())
+    for path in sorted(_PENDING_DIR.glob("*.json")):
+        try:
+            data = json.loads(path.read_text())
+            update = Update.de_json(data, application.bot)
+            user = update.effective_user
+            message = update.effective_message
+            if user is None or message is None or user.id not in allowlist:
+                continue
+            try:
+                await application.bot.send_message(
+                    chat_id=message.chat_id,
+                    text=(
+                        "I was offline when your last message arrived\\. "
+                        "Please send it again if you still want a reply\\."
+                    ),
+                    parse_mode=ParseMode.MARKDOWN_V2,
+                )
+                log.info(
+                    "notified user_id=%s about pending update_id=%s",
+                    user.id, update.update_id,
+                )
+            except Exception:
+                log.exception(
+                    "failed to notify user_id=%s about pending update_id=%s",
+                    user.id, update.update_id,
+                )
+        except Exception:
+            log.exception("failed to parse pending update file %s", path)
+        finally:
+            path.unlink(missing_ok=True)
 
 
 def _parse_ids(raw: str) -> set[int]:
@@ -103,6 +172,20 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Persist the update, run the handler, clear on success.
+
+    Persisting on entry means a crash mid-handler leaves a record that the
+    startup hook (`_notify_pending_on_startup`) can use to tell the user we
+    dropped their request.
+    """
+    _persist_update(update)
+    try:
+        await _on_text_impl(update, ctx)
+    finally:
+        _clear_update(update.update_id)
+
+
+async def _on_text_impl(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     allowlist: set[int] = ctx.bot_data["allowlist"]
     silent_reject: bool = ctx.bot_data["silent_reject"]
     llm_model: Optional[str] = ctx.bot_data["llm_model"]
@@ -274,7 +357,12 @@ def _build_app() -> Application:
     if not allowlist:
         log.warning("TELEGRAM_ALLOWED_USER_IDS is empty — bot will reject every message.")
 
-    app = ApplicationBuilder().token(token).build()
+    app = (
+        ApplicationBuilder()
+        .token(token)
+        .post_init(_notify_pending_on_startup)
+        .build()
+    )
     app.bot_data["allowlist"] = allowlist
     app.bot_data["silent_reject"] = os.environ.get("TELEGRAM_SILENT_REJECT", "1") == "1"
     app.bot_data["llm_model"] = os.environ.get("OLLAMA_MODEL") or None
@@ -312,8 +400,30 @@ def main() -> None:
     logging.getLogger("telegram.ext").setLevel(logging.INFO)
 
     app = _build_app()
-    log.info("starting long-polling loop")
-    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
+
+    webhook_url = os.environ.get("TELEGRAM_WEBHOOK_URL", "").strip()
+    if webhook_url:
+        # Webhook mode: required on Fly.io (or any host that suspends idle VMs)
+        # because long polling can't wake a stopped machine. Telegram POSTs the
+        # update to `webhook_url`, Fly's proxy starts the suspended VM on that
+        # inbound HTTP, and PTB processes the update normally.
+        port = int(os.environ.get("PORT") or os.environ.get("TELEGRAM_WEBHOOK_PORT", "8080"))
+        url_path = os.environ.get("TELEGRAM_WEBHOOK_PATH", "/webhook")
+        secret = os.environ.get("TELEGRAM_WEBHOOK_SECRET") or None
+        full_url = f"{webhook_url.rstrip('/')}{url_path}"
+        log.info("starting webhook listen=0.0.0.0:%d path=%s url=%s", port, url_path, full_url)
+        app.run_webhook(
+            listen="0.0.0.0",
+            port=port,
+            url_path=url_path.lstrip("/"),
+            webhook_url=full_url,
+            secret_token=secret,
+            allowed_updates=Update.ALL_TYPES,
+            drop_pending_updates=False,
+        )
+    else:
+        log.info("starting long-polling loop")
+        app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 
 if __name__ == "__main__":

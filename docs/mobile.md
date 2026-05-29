@@ -77,6 +77,47 @@ The watchlist lives in a single JSON file:
 
 No database is involved. Writes are atomic (tempfile + `os.replace`).
 
+## Waking from suspended hosts (Fly.io)
+
+Fly.io's free tier auto-suspends idle machines. Telegram **long polling cannot
+wake a suspended machine** — the poll connection is outbound from the VM, so a
+sleeping VM has no listener for inbound Telegram traffic. The bot supports two
+modes:
+
+| Mode | When to use | Set |
+|---|---|---|
+| Long polling | Local dev, always-on hosts (Pi, Oracle) | leave `TELEGRAM_WEBHOOK_URL` unset |
+| Webhook | Fly.io / any host with idle-suspend | set `TELEGRAM_WEBHOOK_URL=https://<app>.fly.dev` |
+
+In webhook mode, Telegram POSTs each update over HTTPS to `<URL>/webhook` (path
+configurable via `TELEGRAM_WEBHOOK_PATH`). Fly's proxy automatically resumes
+the suspended VM on that inbound request, and the bot processes the message
+normally. If the proxy can't wake the machine before its timeout, Telegram
+**retries** the delivery for up to ~24 hours, so messages aren't lost.
+
+### Crash safety
+
+Every incoming update is written to `STOCK_RHETORIC_PENDING_DIR` (default
+`~/.cache/stock_rhetoric/pending_updates`) **before** the handler runs, and the
+file is deleted on success. If the bot crashes or the machine is suspended
+mid-handler, the next startup notifies the affected user(s) with:
+
+> _I was offline when your last message arrived. Please send it again if you
+> still want a reply._
+
+Stale files are removed after notification. On Fly.io the pending dir lives on
+a tiny persistent volume (`/data`) so this survives machine moves.
+
+### Webhook env vars
+
+| Var | Default | Purpose |
+|---|---|---|
+| `TELEGRAM_WEBHOOK_URL` | (unset) | If set, switches `main()` to webhook mode. Must be the public HTTPS URL of the app — e.g. `https://stock-rhetoric.fly.dev`. |
+| `TELEGRAM_WEBHOOK_PATH` | `/webhook` | URL path the bot listens on. |
+| `TELEGRAM_WEBHOOK_PORT` | `8080` (or `PORT`) | Local port to bind. Fly maps it to 443 externally. |
+| `TELEGRAM_WEBHOOK_SECRET` | (unset) | Optional shared secret; if set, Telegram includes it in a header and PTB rejects mismatches. |
+| `STOCK_RHETORIC_PENDING_DIR` | `~/.cache/.../pending_updates` | Where in-flight updates are persisted. |
+
 ## Deployment
 
 The bot runs anywhere Python 3.11+ runs. The recommended free path is **Fly.io

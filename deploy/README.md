@@ -19,18 +19,39 @@ fly auth signup
 # 3. Create the app (from repo root; accept suggested name and region)
 fly launch --no-deploy
 
-# 4. Set secrets (never committed to git)
+# 4. Edit fly.toml: replace TELEGRAM_WEBHOOK_URL with your real app URL,
+#    e.g. https://<your-app>.fly.dev (no trailing slash, no /webhook).
+#    The bot appends the path itself.
+
+# 5. Create the tiny persistent volume the bot mounts at /data
+#    (holds the watchlist + the pending-updates log).
+fly volumes create bot_data --region <your-region> --size 1
+
+# 6. Set secrets (never committed to git)
 fly secrets set \
   TELEGRAM_BOT_TOKEN="<token from BotFather>" \
   TELEGRAM_ALLOWED_USER_IDS="<your numeric id>" \
+  TELEGRAM_WEBHOOK_SECRET="$(openssl rand -hex 32)" \
   GROQ_API_KEY="<key from console.groq.com>" \
   SEC_EDGAR_UA="stock-rhetoric you@example.com"
 
-# 5. Deploy
+# 7. Deploy
 fly deploy --dockerfile /deploy/Dockerfile
 ```
 
-**Verify:** `fly logs` — you should see `starting long-polling loop` within seconds. Message your bot with `AAPL` from your phone.
+**Verify:** `fly logs` — within seconds you should see
+`starting webhook listen=0.0.0.0:8080 path=/webhook url=https://...`.
+Message your bot with `AAPL` from your phone. The first message after a long
+idle period takes ~5–10s extra while Fly resumes the suspended machine;
+Telegram retries automatically if the first POST times out.
+
+**Why webhooks on Fly.io?** Fly's free tier suspends idle VMs. Long polling is
+*outbound* HTTP from the VM, so a suspended VM has no listener — your messages
+would never wake it. Webhooks invert the flow: Telegram POSTs *to* the app,
+Fly's proxy resumes the machine on that inbound request, and the bot answers
+normally. If the bot crashes mid-handler, the next startup notifies the user
+that their last message was dropped (via the on-disk pending-updates log under
+`/data/pending_updates`).
 
 **Operating notes:**
 - **Logs:** `fly logs` (add `-i <instance-id>` for a specific machine)

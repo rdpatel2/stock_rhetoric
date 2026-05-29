@@ -6,13 +6,37 @@
 app = 'stock-rhetoric-noble-harborlight-1287'
 primary_region = 'iad'
 
+[build]
+  dockerfile = "deploy/Dockerfile"
+
+# Inbound HTTP → wake the suspended machine. Telegram POSTs to /webhook.
+# `auto_stop_machines = "suspend"` is faster to resume than "stop" because
+# the machine state is kept in RAM. Fly's free tier allows this.
 [http_service]
   internal_port = 8080
   force_https = true
-  auto_stop_machines = 'stop'
+  auto_stop_machines = 'suspend'
   auto_start_machines = true
   min_machines_running = 0
   processes = ['app']
+
+[env]
+  # Long polling can't wake a suspended Fly machine. Set the webhook URL so the
+  # bot's main() uses run_webhook() instead. Fly proxies inbound HTTPS POSTs
+  # from Telegram to this app, which wakes the VM automatically.
+  TELEGRAM_WEBHOOK_URL = "https://stock-rhetoric-noble-harborlight-1287.fly.dev"
+  TELEGRAM_WEBHOOK_PATH = "/webhook"
+  # Persist incoming updates to a Fly volume so a crash mid-handler can be
+  # detected on the next boot and the user notified.
+  STOCK_RHETORIC_PENDING_DIR = "/data/pending_updates"
+  STOCK_RHETORIC_WATCHLIST_PATH = "/data/watchlists.json"
+  OLLAMA_TIMEOUT_S = "30"
+
+# Tiny persistent disk for the pending-updates log and the watchlist file.
+# Create once with: fly volumes create bot_data --region iad --size 1
+[mounts]
+  source = "bot_data"
+  destination = "/data"
 
 [[vm]]
   memory = '256mb'
