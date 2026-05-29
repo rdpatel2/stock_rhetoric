@@ -41,6 +41,8 @@ class PricePerformance:
     high_52w: Optional[float] = None
     low_52w: Optional[float] = None
     change_today_pct: Optional[float] = None
+    return_1d: Optional[float] = None
+    return_1w: Optional[float] = None
     return_1m: Optional[float] = None
     return_3m: Optional[float] = None
     return_6m: Optional[float] = None
@@ -284,7 +286,8 @@ def _price_performance(t: yf.Ticker, info: dict) -> PricePerformance:
         if len(closes) <= days:
             return None
         return float(last / closes.iloc[-days - 1] - 1)
-
+    pp.return_1d = _ret(1)
+    pp.return_1w = _ret(5)
     pp.return_1m = _ret(21)
     pp.return_3m = _ret(63)
     pp.return_6m = _ret(126)

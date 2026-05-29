@@ -11,6 +11,7 @@ from typing import Optional
 
 from .report import Report
 from .risk import RiskFlag
+from .watchlist import WatchQuote
 
 
 # MarkdownV2 reserved characters that must be backslash-escaped in body text.
@@ -45,6 +46,17 @@ def escape_mdv2_url(url: str) -> str:
     return _MDV2_URL_RE.sub(r"\\\1", str(url))
 
 
+_YAHOO_QUOTE_URL = "https://finance.yahoo.com/quote/{}"
+
+
+def yahoo_ticker_link(ticker: str) -> str:
+    """Bold ticker wrapped in a MarkdownV2 link to the Yahoo Finance quote page."""
+    return (
+        f"[*{escape_mdv2(ticker)}*]"
+        f"({escape_mdv2_url(_YAHOO_QUOTE_URL.format(ticker))})"
+    )
+
+
 def _fmt_num(v: Optional[float], spec: str = "{:.1f}") -> str:
     if v is None:
         return "n/a"
@@ -75,7 +87,7 @@ def _header(report: Report) -> list[str]:
     c = report.fin.company
     p = report.fin.price
     name = escape_mdv2(c.name or c.ticker)
-    line1 = f"*{escape_mdv2(c.ticker)}* — {name}"
+    line1 = f"{yahoo_ticker_link(c.ticker)} — {name}"
     sector_bits = [b for b in (c.sector, c.industry) if b]
     line2 = escape_mdv2(" · ".join(sector_bits)) if sector_bits else ""
     price_parts: list[str] = []
@@ -83,9 +95,11 @@ def _header(report: Report) -> list[str]:
         price_parts.append(f"${_fmt_num(p.current, '{:.2f}')}")
     if p.low_52w is not None and p.high_52w is not None:
         price_parts.append(f"52w ${_fmt_num(p.low_52w, '{:.2f}')}–${_fmt_num(p.high_52w, '{:.2f}')}")
+    if p.return_1w is not None:
+        price_parts.append(f"1w {_fmt_pct(p.return_1w, 0)}")
     if p.return_1y is not None:
         price_parts.append(f"1y {_fmt_pct(p.return_1y, 0)}")
-    line3 = escape_mdv2(" · ".join(price_parts)) if price_parts else ""
+    line3 = escape_mdv2(" \n ".join(price_parts)) if price_parts else ""
     return [l for l in (line1, line2, line3) if l]
 
 
@@ -97,15 +111,6 @@ def _verdict(report: Report) -> list[str]:
     if n.rationale:
         out.append(escape_mdv2(n.rationale))
     return out
-
-
-def _score_block(report: Report) -> list[str]:
-    sc = report.scorecard
-    out = [f"*Score:* {_fmt_score(sc.overall)}/100 · {escape_mdv2(sc.band)}"]
-    for cat in sc.categories:
-        out.append(f"{escape_mdv2(cat.name)}: {escape_mdv2(_fmt_score(cat.score))}")
-    return out
-
 
 def _summary(report: Report) -> list[str]:
     text = report.narrative.executive_summary or ""
@@ -192,6 +197,28 @@ def _news_block(
     return lines
 
 
+def _earnings_block(report: Report) -> list[str]:
+    fin = report.fin
+    next_date = fin.next_earnings_date
+    # earnings_records appears oldest-first in yfinance; show most-recent first.
+    records = list(reversed(fin.earnings_records or []))[:4]
+    if next_date is None and not records:
+        return []
+    lines = ["*Earnings*"]
+    if next_date is not None:
+        lines.append(f"Next: {escape_mdv2(next_date.isoformat())}")
+    for r in records:
+        q = escape_mdv2(r.quarter.isoformat()) if r.quarter else "n/a"
+        est = escape_mdv2(_fmt_num(r.eps_estimate, "{:.2f}"))
+        act = escape_mdv2(_fmt_num(r.eps_actual, "{:.2f}"))
+        if r.surprise_pct is not None:
+            surp = escape_mdv2(f"{r.surprise_pct:+.1f}%")
+        else:
+            surp = "n/a"
+        lines.append(f"{q}: est {est} · act {act} · {surp}")
+    return lines
+
+
 def _footer(report: Report) -> list[str]:
     timings = report.stage_timings or {}
     total = sum(v for v in timings.values() if isinstance(v, (int, float)))
@@ -207,54 +234,59 @@ def _assemble(blocks: list[list[str]]) -> str:
 def format_report(report: Report, *, max_chars: int = 3800) -> str:
     """Render a Report into a MarkdownV2-safe string under `max_chars`.
 
-    Length governor: if the full message overruns, drop sections from the bottom
-    (metrics → FINRA) and then trim bullets to two each before truncating.
+    Order: Stock info · Summary · Metrics · Earnings · Verdict · Bullish · Bearish · News.
+    Length governor shrinks/drops from the bottom-up, preserving header/summary/verdict.
     """
     header = _header(report)
-    verdict = _verdict(report)
-    score = _score_block(report)
     summary = _summary(report)
+    metrics = _metrics_block(report)
+    earnings = _earnings_block(report)
+    verdict = _verdict(report)
     bullish = _bullets("Bullish", report.narrative.bullish)
     bearish = _bullets("Bearish", report.narrative.bearish)
-    risks = _risk_flags(report.risk_flags)
-    finra = _finra_line(report)
     news = _news_block(report)
-    metrics = _metrics_block(report)
     footer = _footer(report)
 
-    # Index in `blocks` matters for the length governor below.
-    blocks = [header, verdict, score, summary, bullish, bearish, risks, finra, news, metrics, footer]
+    # Indices matter for the governor below.
+    blocks = [header, summary, metrics, earnings, verdict, bullish, bearish, news, footer]
     text = _assemble(blocks)
     if len(text) <= max_chars:
         return text
 
-    # Step 1: shrink the news section before dropping anything.
-    blocks[8] = _news_block(report, reliable_limit=3, social_limit=1)
+    # Step 1: shrink news
+    blocks[7] = _news_block(report, reliable_limit=3, social_limit=1)
     text = _assemble(blocks)
     if len(text) <= max_chars:
         return text
 
-    # Step 2: drop metrics
-    blocks[9] = []
-    text = _assemble(blocks)
-    if len(text) <= max_chars:
-        return text
-
-    # Step 3: drop FINRA
+    # Step 2: drop news
     blocks[7] = []
     text = _assemble(blocks)
     if len(text) <= max_chars:
         return text
 
-    # Step 4: trim bullets to two each
-    blocks[4] = _bullets("Bullish", report.narrative.bullish, limit=2)
-    blocks[5] = _bullets("Bearish", report.narrative.bearish, limit=2)
+    # Step 3: trim bullets to two each
+    blocks[5] = _bullets("Bullish", report.narrative.bullish, limit=2)
+    blocks[6] = _bullets("Bearish", report.narrative.bearish, limit=2)
     text = _assemble(blocks)
     if len(text) <= max_chars:
         return text
 
-    # Step 5: drop news entirely
-    blocks[8] = []
+    # Step 4: drop bullets entirely
+    blocks[5] = []
+    blocks[6] = []
+    text = _assemble(blocks)
+    if len(text) <= max_chars:
+        return text
+
+    # Step 5: drop earnings
+    blocks[3] = []
+    text = _assemble(blocks)
+    if len(text) <= max_chars:
+        return text
+
+    # Step 6: drop metrics
+    blocks[2] = []
     text = _assemble(blocks)
     if len(text) <= max_chars:
         return text
@@ -277,5 +309,87 @@ def format_help() -> str:
         "*stock\\-rhetoric bot*\n\n"
         "Send a ticker symbol \\(e\\.g\\. `AAPL`\\) and I'll reply with the report\\.\n"
         "Reports take 10–60s depending on the model and network\\.\n\n"
+        "*Watchlist*\n"
+        "`add AAPL` — track a ticker\n"
+        "`remove AAPL` — stop tracking\n"
+        "`list` — show your watchlist\n\n"
+        "Daily digests post at 9:30 AM ET \\(1w change\\) and 4:30 PM ET \\(1d change\\)\\.\n\n"
         "_One request at a time per user\\._"
     )
+
+
+def format_watchlist_ack(status: str, ticker: str, count: int = 0) -> str:
+    """One-liner MarkdownV2 acknowledgement for add/remove operations."""
+    t = escape_mdv2(ticker)
+    if status == "added":
+        return f"✓ Tracking *{t}* \\({count} in watchlist\\)\\."
+    if status == "duplicate":
+        return f"Already tracking *{t}*\\."
+    if status == "invalid":
+        return f"*{t}* isn't a valid ticker\\."
+    if status == "removed":
+        return f"✓ Stopped tracking *{t}*\\."
+    if status == "not_in_list":
+        return f"*{t}* isn't in your watchlist\\."
+    return escape_mdv2(f"{status}: {ticker}")
+
+
+def format_watchlist_list(quotes: list[WatchQuote]) -> str:
+    """Bulleted MDv2 list with current prices, or empty-state hint."""
+    if not quotes:
+        return (
+            "Your watchlist is empty\\. Use `add AAPL` to start tracking a ticker\\."
+        )
+    lines = ["*Watchlist*"]
+    for q in quotes:
+        price = escape_mdv2(f"${q.price:.2f}") if q.price is not None else "n/a"
+        lines.append(f"• {yahoo_ticker_link(q.ticker)} {price}")
+    return "\n".join(lines)
+
+
+def _fmt_change(v: Optional[float]) -> str:
+    if v is None:
+        return "n/a"
+    return f"{v * 100:+.2f}%"
+
+
+def _change_glyph(v: Optional[float]) -> str:
+    if v is None:
+        return "·"
+    if v > 0:
+        return "↑"
+    if v < 0:
+        return "↓"
+    return "·"
+
+
+def format_digest(mode: str, quotes: list[WatchQuote]) -> str:
+    """mode='open' → 1w change. mode='close' → 1d change."""
+    if mode == "open":
+        header = "*Watchlist · market open · 1w change*"
+        change_attr = "change_1w"
+    else:
+        header = "*Watchlist · market close · 1d change*"
+        change_attr = "change_1d"
+
+    if not quotes:
+        return f"{header}\n_Your watchlist is empty\\._"
+
+    lines = [header]
+    for q in quotes:
+        link = yahoo_ticker_link(q.ticker)
+        if q.error and q.price is None:
+            lines.append(f"· {link} — {escape_mdv2(q.error)}")
+            continue
+        change = getattr(q, change_attr)
+        glyph = _change_glyph(change)
+        price_text = (
+            escape_mdv2(f"${q.price:.2f}") if q.price is not None else "n/a"
+        )
+        change_text = escape_mdv2(_fmt_change(change))
+        if q.next_earnings is not None:
+            earn_text = " · earn " + escape_mdv2(q.next_earnings.isoformat())
+        else:
+            earn_text = ""
+        lines.append(f"{glyph} {link} {price_text} {change_text}{earn_text}")
+    return "\n".join(lines)

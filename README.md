@@ -9,6 +9,10 @@ direction.
 All data sources are free. Summarization runs locally via Ollama — nothing is paid
 and no data leaves your machine.
 
+**Mobile / Telegram bot:** see [`docs/mobile.md`](docs/mobile.md) for the
+on-the-go interface — one-shot reports, watchlist tracking, and scheduled
+market-open / market-close digests.
+
 ## Setup
 
 ```bash

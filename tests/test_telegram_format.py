@@ -9,10 +9,11 @@ from __future__ import annotations
 
 import re
 
-from datetime import datetime
+from datetime import date, datetime
 
 from stock_rhetoric import scoring, trends, risk
 from stock_rhetoric.aggregator import SentimentBundle
+from stock_rhetoric.financials import EarningsRecord
 from stock_rhetoric.finra import DayVolume, FinraData
 from stock_rhetoric.llm import Narrative
 from stock_rhetoric.report import Report
@@ -149,21 +150,34 @@ def test_format_handles_finra_with_data(strong_company_financials):
             for i in range(5)
         ],
     )
-    # All identical → std == 0 → avg_z_score is None and label is Neutral.
+    # FINRA was removed from the Telegram layout — formatter must still render
+    # the rest of the report cleanly when finra data is attached.
     text = format_report(_build_report(strong_company_financials, finra=finra))
-    assert "FINRA short" in text
+    assert "*STRONG*" in text
+    assert "FINRA" not in text
 
 
-def test_format_handles_unscored(strong_company_financials):
-    """If scoring produced no overall score, render n/a without exception."""
-    report = _build_report(strong_company_financials)
-    # Manually wipe scores to simulate complete data loss.
-    for cat in report.scorecard.categories:
-        cat.score = None
-    report.scorecard.overall = None
-    report.scorecard.band = "Unscored"
-    text = format_report(report)
-    assert "n/a/100" in text
+def test_report_header_ticker_is_yahoo_link(strong_company_financials):
+    text = format_report(_build_report(strong_company_financials))
+    assert "[*STRONG*](https://finance.yahoo.com/quote/STRONG)" in text
+
+
+def test_format_does_not_render_score_section(strong_company_financials):
+    """Scores are intentionally not part of the Telegram layout."""
+    text = format_report(_build_report(strong_company_financials))
+    assert "*Score:*" not in text
+
+
+def test_format_does_not_render_risk_or_finra_sections(weak_company_financials):
+    """Risk flags and FINRA were removed from the Telegram layout."""
+    text = format_report(
+        _build_report(
+            weak_company_financials,
+            narrative=_fake_narrative(direction="SELL", confidence="High"),
+        )
+    )
+    assert "*Risk flags" not in text
+    assert "*FINRA" not in text
 
 
 def test_format_weak_report(weak_company_financials):
@@ -175,12 +189,10 @@ def test_format_weak_report(weak_company_financials):
     )
     assert "*WEAK*" in text
     assert "SELL" in text
-    # Risk flags section should be present (weak fixture trips multiple rules).
-    assert "*Risk flags" in text
 
 
 def test_format_length_governor(strong_company_financials):
-    """When forced under a tight cap, metrics/FINRA get dropped before truncation."""
+    """When forced under a tight cap, lower-priority blocks drop before truncation."""
     report = _build_report(strong_company_financials)
     text = format_report(report, max_chars=600)
     assert len(text) <= 600
@@ -201,22 +213,47 @@ def test_format_help_renders():
     assert "stock" in out and "bot" in out
 
 
-def test_score_categories_full_names_each_on_own_line(strong_company_financials):
+def test_format_earnings_block_renders_records_and_next_date(strong_company_financials):
+    fin = strong_company_financials
+    fin.next_earnings_date = date(2026, 7, 25)
+    fin.earnings_records = [
+        EarningsRecord(quarter=date(2025, 3, 31), eps_estimate=1.20, eps_actual=1.30, surprise_pct=8.3),
+        EarningsRecord(quarter=date(2025, 6, 30), eps_estimate=1.40, eps_actual=1.35, surprise_pct=-3.6),
+        EarningsRecord(quarter=date(2025, 9, 30), eps_estimate=1.50, eps_actual=1.62, surprise_pct=8.0),
+        EarningsRecord(quarter=date(2025, 12, 31), eps_estimate=1.60, eps_actual=1.70, surprise_pct=6.2),
+    ]
+    text = format_report(_build_report(fin))
+    assert "*Earnings*" in text
+    assert "Next: 2026\\-07\\-25" in text  # date hyphens escaped
+    # Most recent quarter shown first
+    assert "2025\\-12\\-31" in text
+    assert "est 1\\.60" in text
+    assert "act 1\\.70" in text
+    # Earnings appears between Metrics and Verdict
+    text_lookup = lambda needle: text.find(needle)
+    assert text_lookup("*Metrics*") < text_lookup("*Earnings*") < text_lookup("*Verdict:*")
+
+
+def test_format_earnings_block_skipped_when_no_data(strong_company_financials):
+    """Strong fixture has no earnings_records by default — block must be absent."""
     text = format_report(_build_report(strong_company_financials))
-    # Every category renders with its full name and its own line.
-    for full_name in (
-        "Growth",
-        "Profitability",
-        "Financial Stability",
-        "Cash Flow Health",
-        "Valuation",
-        "Shareholder Returns",
-        "Operational Efficiency",
-    ):
-        assert f"\n{full_name}: " in "\n" + text, f"missing line for {full_name}"
-    # No abbreviated 'G 78 · P 65' joins remain.
-    assert " · P " not in text
-    assert " · SH " not in text
+    assert "*Earnings*" not in text
+
+
+def test_format_section_order(strong_company_financials):
+    """Spec'd order: Stock info → Summary → Metrics → Verdict → News (earnings between
+    Metrics and Verdict when present in the fixture)."""
+    text = format_report(_build_report(strong_company_financials))
+    indices = {
+        "header": text.find("*STRONG*"),
+        "summary": text.find("*Summary*"),
+        "metrics": text.find("*Metrics*"),
+        "verdict": text.find("*Verdict:*"),
+    }
+    assert all(v != -1 for v in indices.values()), indices
+    assert indices["header"] < indices["summary"]
+    assert indices["summary"] < indices["metrics"]
+    assert indices["metrics"] < indices["verdict"]
 
 
 def test_metrics_each_on_own_line(strong_company_financials):
@@ -288,6 +325,8 @@ def test_no_unescaped_specials_in_payload(strong_company_financials):
     decoration we intentionally emitted.
     """
     text = format_report(_build_report(strong_company_financials))
-    # Confirm every '.' is escaped (no bare numeric dots like "25.0").
+    # Strip MDv2 inline-link URLs: inside `](...)` only `)` and `\` are escaped — bare
+    # dots are legal there and don't count against this check.
+    body = re.sub(r"\]\([^)]*\)", "]()", text)
     bare_dot = re.compile(r"(?<!\\)\.")
-    assert not bare_dot.search(text), f"Bare '.' found:\n{text}"
+    assert not bare_dot.search(body), f"Bare '.' found:\n{body}"

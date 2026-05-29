@@ -13,7 +13,9 @@ import asyncio
 import logging
 import os
 import re
+from datetime import time as dtime
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
 from telegram import Update
@@ -28,13 +30,19 @@ from telegram.ext import (
     filters,
 )
 
-from . import report as report_mod
+from . import market, report as report_mod, watchlist
 from .telegram_format import (
     escape_mdv2,
+    format_digest,
     format_error,
     format_help,
     format_report,
+    format_watchlist_ack,
+    format_watchlist_list,
 )
+
+
+_NY = ZoneInfo("America/New_York")
 
 
 log = logging.getLogger("stock_rhetoric.bot")
@@ -111,9 +119,25 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             await message.reply_text("Not authorized.")
         return
 
-    raw = (message.text or "").strip().upper()
+    raw = (message.text or "").strip()
+    parts = raw.upper().split(maxsplit=1)
+    verb = parts[0] if parts else ""
+
+    if verb == "ADD" and len(parts) == 2:
+        await _handle_add(message, user.id, parts[1])
+        return
+    if verb in {"REMOVE", "RM"} and len(parts) == 2:
+        await _handle_remove(message, user.id, parts[1])
+        return
+    if verb in {"LIST", "WATCHLIST"}:
+        await _handle_list(message, user.id)
+        return
+
+    raw = raw.upper()
     if not _TICKER_RE.match(raw):
-        await message.reply_text("Send a ticker like AAPL.")
+        await message.reply_text(
+            "Send a ticker like AAPL, or `add AAPL` / `remove AAPL` / `list`."
+        )
         return
 
     lock = _user_lock(user.id)
@@ -173,6 +197,70 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             typing_task.cancel()
 
 
+async def _handle_add(message, user_id: int, raw_ticker: str) -> None:
+    status, norm = await asyncio.to_thread(watchlist.add, str(user_id), raw_ticker)
+    count = len(watchlist.get(str(user_id)))
+    text = format_watchlist_ack(status, norm, count=count)
+    await message.reply_text(text, parse_mode=ParseMode.MARKDOWN_V2)
+    log.info("watchlist add user_id=%s ticker=%s status=%s", user_id, norm, status)
+
+
+async def _handle_remove(message, user_id: int, raw_ticker: str) -> None:
+    status, norm = await asyncio.to_thread(watchlist.remove, str(user_id), raw_ticker)
+    count = len(watchlist.get(str(user_id)))
+    text = format_watchlist_ack(status, norm, count=count)
+    await message.reply_text(text, parse_mode=ParseMode.MARKDOWN_V2)
+    log.info("watchlist remove user_id=%s ticker=%s status=%s", user_id, norm, status)
+
+
+async def _handle_list(message, user_id: int) -> None:
+    tickers = await asyncio.to_thread(watchlist.get, str(user_id))
+    quotes = await watchlist.build_digest(tickers) if tickers else []
+    await message.reply_text(
+        format_watchlist_list(quotes), parse_mode=ParseMode.MARKDOWN_V2
+    )
+
+
+async def _run_digest(ctx: ContextTypes.DEFAULT_TYPE, mode: str) -> None:
+    """Build and send the open/close digest to every user who has a watchlist."""
+    if not await asyncio.to_thread(lambda: market.check_nyse().is_open):
+        log.info("digest %s skipped: market closed", mode)
+        return
+
+    allowlist: set[int] = ctx.bot_data.get("allowlist", set())
+    data = await asyncio.to_thread(watchlist.load)
+    for user_key, tickers in data.items():
+        if not tickers:
+            continue
+        try:
+            user_id = int(user_key)
+        except ValueError:
+            continue  # 'cli' or other non-numeric keys
+        if user_id not in allowlist:
+            continue
+        try:
+            quotes = await watchlist.build_digest(tickers)
+            text = format_digest(mode, quotes)
+            try:
+                await ctx.bot.send_message(
+                    chat_id=user_id, text=text, parse_mode=ParseMode.MARKDOWN_V2
+                )
+            except BadRequest as e:
+                log.warning("digest MarkdownV2 send failed, retrying plain: %s", e)
+                await ctx.bot.send_message(chat_id=user_id, text=text)
+            log.info("digest %s sent user_id=%s tickers=%d", mode, user_id, len(tickers))
+        except Exception:
+            log.exception("digest %s failed for user_id=%s", mode, user_id)
+
+
+async def _open_digest_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await _run_digest(ctx, "open")
+
+
+async def _close_digest_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await _run_digest(ctx, "close")
+
+
 async def on_error(update: object, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     log.exception("Unhandled bot error", exc_info=ctx.error)
 
@@ -196,6 +284,20 @@ def _build_app() -> Application:
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     app.add_error_handler(on_error)
+
+    if app.job_queue is None:
+        log.warning(
+            "JobQueue unavailable — install python-telegram-bot[job-queue]; "
+            "watchlist digests will not run."
+        )
+    else:
+        app.job_queue.run_daily(
+            _open_digest_job, time=dtime(9, 30, tzinfo=_NY), name="open_digest"
+        )
+        app.job_queue.run_daily(
+            _close_digest_job, time=dtime(16, 30, tzinfo=_NY), name="close_digest"
+        )
+        log.info("scheduled watchlist digests: open 09:30 ET, close 16:30 ET")
     return app
 
 
